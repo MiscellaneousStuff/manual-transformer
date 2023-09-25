@@ -6,7 +6,8 @@ torch.manual_seed(1337)
 block_size = 3
 vocab_len  = 3
 
-toks = ["hello", "world", "geez"]
+# toks = ["hello", "world", "geez"]
+toks = ["a", "b", "c"]
 decode = lambda inp: " ".join([toks[t] for t in inp])
     
 class BigramLM(nn.Module):
@@ -75,6 +76,7 @@ class Head(nn.Module):
         # compute attention scores "affinities"
         wei = q @ k.transpose(-2, -1) * C**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        print("wei Q * K:", wei)
         wei = F.softmax(wei, dim=-1)
 
         print("Q * K:", wei)
@@ -88,7 +90,7 @@ class Head(nn.Module):
 
         return out
 
-class ImprovedLM(nn.Module):
+class HeadModel(nn.Module):
 
     def __init__(self, vocab_len, block_size, head_size, n_embed, device):
         super().__init__()
@@ -141,7 +143,7 @@ class ImprovedLM(nn.Module):
     
 def head():
     # Initialse Self-Attention Head Model
-    model = ImprovedLM(
+    model = HeadModel(
         block_size=block_size,
         head_size=3,
         n_embed=3,
@@ -188,6 +190,160 @@ def head():
     print("PRED:", pred_p, pred_p.shape)
     print(decode(pred_p))
 
+class InductionHeadModel(nn.Module):
+
+    def __init__(self, vocab_len, block_size, head_size, n_embed, device):
+        super().__init__()
+        self.token_emb_table = nn.Embedding(vocab_len, n_embed)
+        self.position_embedding_table = nn.Embedding(block_size, n_embed)
+
+        self.sa_head_0 = Head(head_size=n_embed, n_embed=n_embed)
+        self.lm_head_0 = nn.Linear(n_embed, n_embed, bias=False)
+        # self.lm_head_0 = nn.Linear(n_embed, vocab_len, bias=False)
+
+        self.sa_head_1 = Head(head_size=n_embed, n_embed=n_embed)
+        self.lm_head_1 = nn.Linear(n_embed, vocab_len, bias=False)
+
+        self.device = device
+
+    def forward(self, idx, targets=None):
+        # idx and targets are both (B, T) tensor of integers
+        B, T = idx.shape
+
+        token_embed = self.token_emb_table(idx) # (B, T, C)
+
+        print("STR FWD" + "=" * 40)
+        #print("TOKEN_EMBED:", token_embed)
+        pos_emb     = self.position_embedding_table(torch.arange(T, device=self.device)) # (T, C)
+        #print("POS_EMB:", pos_emb)
+        x           = token_embed + pos_emb
+        #print("TOKEN + POS:", x)
+        x           = self.sa_head_0(x)
+        print("SA HEAD 0:", x, x.shape)
+        print("sa_head.shape", x.shape)
+        emb         = self.lm_head_0(x) # (B, T, vocab_size)
+        #print("EMB:", logits)
+        #print("lm_head.shape", x.shape)
+        x           = self.sa_head_1(emb)
+        print("SA HEAD 1:", x, x.shape)
+        logits      = self.lm_head_1(x) # (B, T, vocab_size)
+        # logits      = self.lm_head_0(x) # (B, T, vocab_size)
+        print("LOGITS:", logits)
+        print("END FWD" + "=" * 40)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits  = logits.view(B*T, C)
+            targets = targets.view(B*T) # (B*T := -1)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            print("PROBS:", probs)
+            #idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            _, idx_next = torch.max(probs, dim=-1, keepdim=True)  # Take the argmax instead of sampling
+            idx = torch.cat((idx, idx_next), dim=1) # (B, 1+1)
+        return idx
+    
+def induction_head():
+    show_params = False
+
+    # "123123" -> "123"
+    model = InductionHeadModel(
+        block_size=block_size,
+        head_size=3,
+        n_embed=3,
+        vocab_len=3,
+        device="cpu")
+
+    # Set token embedding values
+    model.token_emb_table.weight = \
+        nn.Parameter(torch.tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], dtype=None))
+
+    # Set position embedding
+    # model.position_embedding_table.weight = \
+    #     nn.Parameter(torch.zeros(*model.position_embedding_table.weight.shape, dtype=None))
+
+    # model.position_embedding_table.weight = \
+    #     nn.Parameter(torch.tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]))
+    model.position_embedding_table.weight = \
+        nn.Parameter(torch.tensor([[0.1, 0.1, 0.1], [0.2, 0.2, 0.2], [0.3, 0.3, 0.3]]))
+
+    # Set head k, q, v weight values for sa_head_0
+    with torch.no_grad():
+        # model.sa_head_0.query.weight.copy_(torch.ones_like(model.sa_head_0.query.weight))
+        # model.sa_head_0.key.weight.copy_(torch.ones_like(model.sa_head_0.key.weight))
+        # model.sa_head_0.value.weight.copy_(torch.ones_like(model.sa_head_0.value.weight))
+        head_0_attn = torch.tensor([[1., 0.2, 0.2], [0.2, 1., 0.2], [0.2, 0.2, 1.]])
+        # model.sa_head_0.query.weight.copy_(torch.eye(model.sa_head_0.query.weight.size(0)))
+        # model.sa_head_0.key.weight.copy_(torch.eye(model.sa_head_0.key.weight.size(0)))
+        # model.sa_head_0.value.weight.copy_(torch.eye(model.sa_head_0.value.weight.size(0)))
+        model.sa_head_0.query.weight.copy_(head_0_attn)
+        model.sa_head_0.key.weight.copy_(head_0_attn)
+        model.sa_head_0.value.weight.copy_(head_0_attn)
+
+    # Set MLP weight values for lm_head 0
+    with torch.no_grad():
+        # model.lm_head.weight.copy_(torch.ones_like(model.lm_head.weight))
+        model.lm_head_0.weight.copy_(torch.eye(model.lm_head_0.weight.size(0)))
+
+    if show_params:
+        print("BLOCK 0")
+        print("model.token_emb_table.weight:", model.token_emb_table.weight, model.token_emb_table.weight.shape)
+        print("model.position_embedding_table.weight:", model.position_embedding_table.weight, model.position_embedding_table.weight.shape)
+        print("model.sa_head_0.query.weight:", model.sa_head_0.query.weight, model.sa_head_0.query.weight.shape)
+        print("model.sa_head_0.key.weight:", model.sa_head_0.key.weight, model.sa_head_0.key.weight.shape)
+        print("model.sa_head_0.value.weight:", model.sa_head_0.value.weight, model.sa_head_0.value.weight.shape)
+        print("model.lm_head_0.weight:", model.lm_head_0.weight, model.lm_head_0.weight.shape)
+    
+    # Set head k, q, v weight values for sa_head_0
+    with torch.no_grad():
+        # model.sa_head.query.weight.copy_(torch.ones_like(model.sa_head.query.weight))
+        # model.sa_head.key.weight.copy_(torch.ones_like(model.sa_head.key.weight))
+        # model.sa_head.value.weight.copy_(torch.ones_like(model.sa_head.value.weight))
+        # head_1_attn = torch.tensor([[0.2, 0.2, 1.], [0.2, 1., 0.2], [1., 0.2, 0.2]])
+        head_1_attn = torch.tensor([[1., .2, .2], [.2, 1., .2], [.2, .2, 1.]])
+
+        # model.sa_head_1.query.weight.copy_(torch.eye(model.sa_head_1.query.weight.size(0)))
+        # model.sa_head_1.key.weight.copy_(torch.eye(model.sa_head_1.key.weight.size(0)))
+        # model.sa_head_1.value.weight.copy_(torch.eye(model.sa_head_1.value.weight.size(0)))
+
+        model.sa_head_1.query.weight.copy_(head_1_attn)
+        model.sa_head_1.key.weight.copy_(head_1_attn)
+        model.sa_head_1.value.weight.copy_(head_1_attn)
+
+    # Set MLP weight values for lm_head 0
+    with torch.no_grad():
+        # model.lm_head.weight.copy_(torch.ones_like(model.lm_head.weight))
+        model.lm_head_1.weight.copy_(torch.eye(model.lm_head_1.weight.size(0)))
+
+    if show_params:
+        print("BLOCK 1")
+        print("model.token_emb_table.weight:", model.token_emb_table.weight, model.token_emb_table.weight.shape)
+        print("model.position_embedding_table.weight:", model.position_embedding_table.weight, model.position_embedding_table.weight.shape)
+        print("model.sa_head_1.query.weight:", model.sa_head_1.query.weight, model.sa_head_1.query.weight.shape)
+        print("model.sa_head_1.key.weight:", model.sa_head_1.key.weight, model.sa_head_1.key.weight.shape)
+        print("model.sa_head_1.value.weight:", model.sa_head_1.value.weight, model.sa_head_1.value.weight.shape)
+        print("model.lm_head_1.weight:", model.lm_head_1.weight, model.lm_head_1.weight.shape)
+    
+    # Pred
+    pred = model.generate(torch.tensor([[0, 1, 2]], dtype=torch.long), max_new_tokens=1)
+    pred_p = pred[0, :]
+    print("PRED:", pred_p, pred_p.shape)
+    print(decode(pred_p))
+
 if __name__ == "__main__":
+    # Implement next token prediction for sequence "hello world geez"
     # bigram()
-    head()
+    # head()
+    
+    # Implement induction head (sequence repeater)
+    induction_head()
+    pass
